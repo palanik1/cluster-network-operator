@@ -1,0 +1,460 @@
+# The ovnkube control-plane components
+
+# The pod disruption budget ensures that we keep a raft quorum
+apiVersion: policy/v1beta1
+kind: PodDisruptionBudget
+metadata:
+  name: ovn-raft-quorum-guard
+  namespace: openshift-ovn-kubernetes
+spec:
+  minAvailable: {{.OVN_MIN_AVAILABLE}}
+  selector:
+    matchLabels:
+      app: ovnkube-master
+
+---
+
+kind: DaemonSet
+apiVersion: apps/v1
+metadata:
+  name: ovnkube-master
+  namespace: openshift-ovn-kubernetes
+  annotations:
+    kubernetes.io/description: |
+      This daemonset launches the ovn-kubernetes controller (master) networking components.
+    release.openshift.io/version: "{{.ReleaseVersion}}"
+spec:
+  selector:
+    matchLabels:
+      app: ovnkube-master
+      ovn-db-pod: "true"
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      # by default, Deployments spin up the new pod before terminating the old one
+      # but we don't want that - because ovsdb holds the lock.
+      maxSurge: 0
+      maxUnavailable: 1
+  template:
+    metadata:
+      labels:
+        app: ovnkube-master
+        ovn-db-pod: "true"
+        component: network
+        type: infra
+        openshift.io/component: network
+        kubernetes.io/os: "linux"
+    spec:
+      serviceAccountName: ovn-kubernetes-controller
+      hostNetwork: true
+      priorityClassName: "system-cluster-critical"
+      # volumes in all containers:
+      # (container) -> (host)
+      # /etc/openvswitch -> /var/lib/ovn/etc - ovsdb data
+      # /var/lib/openvswitch -> /var/lib/ovn/data - ovsdb pki state
+      # /run/openvswitch -> tmpfs - sockets
+      # /env -> configmap env-overrides - debug overrides
+      containers:
+      # ovn-northd: convert network objects in nbdb to flows in sbdb
+      - name: northd
+        image: "{{.OvnImage}}"
+        command:
+        - /bin/bash
+        - -c
+        - |
+           echo "[yaml] Calling ovnkube-cno-master.sh [run-northd]" 
+           /root/ovnkube-cno-master.sh run-northd
+           echo "[yaml] Returned from ovnkube-cno-master.sh" 
+        env:
+        - name: OVN_LOG_LEVEL
+          value: info 
+        - name: OVN_NB_DB_LIST  
+          value: "{{.OVN_NB_DB_LIST}}"
+        - name: OVN_SB_DB_LIST  
+          value: "{{.OVN_SB_DB_LIST}}"
+        volumeMounts:
+        - mountPath: /etc/openvswitch/
+          name: etc-openvswitch
+        - mountPath: /var/lib/openvswitch/
+          name: var-lib-openvswitch
+        - mountPath: /run/openvswitch/
+          name: run-openvswitch
+        - mountPath: /run/ovn/
+          name: run-ovn
+        - mountPath: /env
+          name: env-overrides
+        - mountPath: /ovn-cert # not needed, but useful when exec'ing in to pod.
+          name: ovn-cert
+        - mountPath: /ovn-ca
+          name: ovn-ca
+        resources:
+          requests:
+            cpu: 10m
+            memory: 300Mi
+        terminationMessagePolicy: FallbackToLogsOnError
+
+      # nbdb: the northbound, or logical network object DB. In raft mode 
+      - name: nbdb
+        image: "{{.OvnImage}}"
+        command:
+        - /bin/bash
+        - -c
+        - |
+           echo "[yaml] Calling ovnkube-cno-master.sh [run-nbdb]" 
+           /root/ovnkube-cno-master.sh run-nbdb
+           echo "[yaml] Returned from ovnkube-cno-master.sh" 
+        lifecycle:
+          postStart:
+            exec:
+              command: ["/root/ovnkube-cno-master.sh", "run-nbdb-postStart"]
+          preStop:
+            exec:
+              command: ["/root/ovnkube-cno-master.sh", "run-nbdb-preStop"]
+        readinessProbe:
+          initialDelaySeconds: 60
+          timeoutSeconds: 5
+          exec:
+            command: ["/root/ovnkube-cno-master.sh", "run-nbdb-readinessProbe"]
+        env:
+        - name: OVN_LOG_LEVEL
+          value: info 
+        - name: OVN_NB_RAFT_ELECTION_TIMER
+          value: "{{.OVN_NB_RAFT_ELECTION_TIMER}}"
+        - name: OVN_NORTHD_PROBE_INTERVAL
+          value: "{{.OVN_NORTHD_PROBE_INTERVAL}}"
+        - name: K8S_NODE_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.hostIP
+        - name: OVN_NB_PORT
+          value: "{{.OVN_NB_PORT}}"
+        - name: OVN_MASTER_IP
+          value: "{{.OVN_MASTER_IP}}"
+        - name: OVN_NB_RAFT_PORT 
+          value: "{{.OVN_NB_RAFT_PORT}}"
+        - name: OVN_MASTER_IP
+          value: "{{.OVN_MASTER_IP}}"
+        - name: LISTEN_DUAL_STACK 
+          value: "{{.LISTEN_DUAL_STACK}}"
+        - name: OVN_NB_DB_LIST      
+          value: "{{.OVN_NB_DB_LIST}}"
+        volumeMounts:
+        - mountPath: /etc/openvswitch/
+          name: etc-openvswitch
+        - mountPath: /etc/ovn/
+          name: etc-openvswitch
+        - mountPath: /var/lib/openvswitch/
+          name: var-lib-openvswitch
+        - mountPath: /run/openvswitch/
+          name: run-openvswitch
+        - mountPath: /run/ovn/
+          name: run-ovn
+        - mountPath: /env
+          name: env-overrides
+        - mountPath: /ovn-cert
+          name: ovn-cert
+        - mountPath: /ovn-ca
+          name: ovn-ca
+        resources:
+          requests:
+            cpu: 10m
+            memory: 300Mi
+        ports:
+        - name: nb-db-port
+          containerPort: {{.OVN_NB_PORT}}
+        - name: nb-db-raft-port
+          containerPort: {{.OVN_NB_RAFT_PORT}}
+        terminationMessagePolicy: FallbackToLogsOnError
+
+      - name: kube-rbac-proxy
+        image: {{.KubeRBACProxyImage}}
+        command:
+        - /bin/bash
+        - -c
+        - |
+          #!/bin/bash
+          set -euo pipefail
+          TLS_PK=/etc/pki/tls/metrics-cert/tls.key
+          TLS_CERT=/etc/pki/tls/metrics-cert/tls.crt
+          # As the secret mount is optional we must wait for the files to be present.
+          # The service is created in monitor.yaml and this is created in sdn.yaml.
+          # If it isn't created there is probably an issue so we want to crashloop.
+          retries=0
+          while [[ "${retries}" -lt 100 ]]; do
+            TS=$(
+              curl \
+                -s \
+                --cacert /var/run/secrets/kubernetes.io/serviceaccount/ca.crt \
+                -H "Authorization: Bearer $(cat /var/run/secrets/kubernetes.io/serviceaccount/token)" \
+                "https://${KUBERNETES_SERVICE_HOST}:${KUBERNETES_SERVICE_PORT}/api/v1/namespaces/ovn-kubernetes/services/ovnkube-master" |
+                  python -c 'import json,sys; print(json.load(sys.stdin)["metadata"]["creationTimestamp"])' 2>/dev/null || true
+            ) || :
+            if [ -n "${TS}" ]; then
+              break
+            fi
+            (( retries += 1 ))
+            echo $(date -Iseconds) INFO: Failed to get ovnkube-master service from API. Retry "${retries}"/100 1>&2
+            sleep 20
+          done
+          if [ "${retries}" -ge 20 ]; then
+            echo $(date -Iseconds) FATAL: Unable to get ovnkube-master service from API.
+            exit 1
+          fi
+
+          TS=$(date -d "${TS}" +%s)
+          WARN_TS=$(( ${TS} + $(( 20 * 60)) ))
+          HAS_LOGGED_INFO=0
+          
+          log_missing_certs(){
+              CUR_TS=$(date +%s)
+              if [[ "${CUR_TS}" -gt "WARN_TS"  ]]; then
+                echo $(date -Iseconds) WARN: ovn-master-metrics-cert not mounted after 20 minutes.
+              elif [[ "${HAS_LOGGED_INFO}" -eq 0 ]] ; then
+                echo $(date -Iseconds) INFO: ovn-master-metrics-cert not mounted. Waiting 20 minutes.
+                HAS_LOGGED_INFO=1
+              fi
+          }
+          while [[ ! -f "${TLS_PK}" ||  ! -f "${TLS_CERT}" ]] ; do
+            log_missing_certs
+            sleep 5
+          done
+          
+          exec /usr/bin/kube-rbac-proxy \
+            --logtostderr \
+            --secure-listen-address=:9102 \
+            --tls-cipher-suites=TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,TLS_RSA_WITH_AES_128_CBC_SHA256,TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256,TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256 \
+            --upstream=http://127.0.0.1:29102/ \
+            --tls-private-key-file=${TLS_PK} \
+            --tls-cert-file=${TLS_CERT}
+            
+          #echo "[yaml] calling ovnkube-cno-master.sh [run-kube-rbac-proxy]" 
+           #/root/ovnkube-cno-master.sh run-kube-rbac-proxy
+           #echo "[yaml] returned from ovnkube-cno-master.sh [run-kube-rbac-proxy]" 
+        ports:
+        - containerPort: 9102
+          name: https
+        resources:
+          requests:
+            cpu: 10m
+            memory: 20Mi
+        terminationMessagePolicy: FallbackToLogsOnError
+        volumeMounts:
+        - name: ovn-master-metrics-cert
+          mountPath: /etc/pki/tls/metrics-cert
+          readOnly: True
+
+      # sbdb: The southbound, or flow DB. In raft mode 
+      - name: sbdb
+        image: "{{.OvnImage}}"
+        command:
+        - /bin/bash
+        - -c
+        - |
+           echo "[yaml] calling ovnkube-cno-master.sh [run-sbdb]" 
+           /root/ovnkube-cno-master.sh run-sbdb
+           echo "[yaml] returned from ovnkube-cno-master.sh [run-sbdb]" 
+
+        lifecycle:
+          postStart:
+            exec:
+              command: ["/root/ovnkube-cno-master.sh", "run-sbdb-postStart"]
+          preStop:
+            exec:
+              command: ["/root/ovnkube-cno-master.sh", "run-sbdb-preStop"]
+        readinessProbe:
+          initialDelaySeconds: 60
+          timeoutSeconds: 5
+          exec:
+             command: ["/root/ovnkube-cno-master.sh", "run-sbdb-readinessProbe"]
+        env:
+        - name: OVN_LOG_LEVEL
+          value: info 
+        - name: OVN_SB_RAFT_ELECTION_TIMER
+          value: "{{.OVN_SB_RAFT_ELECTION_TIMER}}"
+        - name: K8S_NODE_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.hostIP
+        - name: OVN_SB_DB_LIST
+          value: "{{.OVN_SB_DB_LIST}}"
+        - name: OVN_CERT_CN
+          value:  "{{.OVN_CERT_CN}}"
+        - name: OVN_NB_DB_LIST
+          value: "{{.OVN_NB_DB_LIST}}"
+        - name: OVN_MASTER_IP
+          value: "{{.OVN_MASTER_IP}}"
+        - name: OVN_SB_RAFT_PORT
+          value: "{{.OVN_SB_RAFT_PORT}}"
+        - name: OVN_SB_PORT
+          value: "{{.OVN_SB_PORT}}"
+        - name: LISTEN_DUAL_STACK
+          value: {{.LISTEN_DUAL_STACK}}
+        volumeMounts:
+        - mountPath: /etc/openvswitch/
+          name: etc-openvswitch
+        - mountPath: /etc/ovn/
+          name: etc-openvswitch
+        - mountPath: /var/lib/openvswitch/
+          name: var-lib-openvswitch
+        - mountPath: /run/openvswitch/
+          name: run-openvswitch
+        - mountPath: /run/ovn/
+          name: run-ovn
+        - mountPath: /env
+          name: env-overrides
+        - mountPath: /ovn-cert
+          name: ovn-cert
+        - mountPath: /ovn-ca
+          name: ovn-ca
+        ports:
+        - name: sb-db-port
+          containerPort: {{.OVN_SB_PORT}}
+        - name: sb-db-raft-port
+          containerPort: {{.OVN_SB_RAFT_PORT}}
+        terminationMessagePolicy: FallbackToLogsOnError
+
+      # ovnkube master: convert kubernetes objects in to nbdb logical network components
+      - name: ovnkube-master
+        image: "{{.OvnImage}}"
+        command:
+        - /bin/bash
+        - -c
+        - |
+           /root/ovnkube-cno-master.sh run-ovnkube-master
+        lifecycle:
+          preStop:
+           exec:
+             command: ["/bin/bash", "-c", "kill $(cat /var/run/ovn/ovn-nbctl.pid) && unset OVN_NB_DAEMON"]
+        volumeMounts:
+        # for checking ovs-configuration service
+        - mountPath: /etc/systemd/system
+          name: systemd-units
+          readOnly: true
+        - mountPath: /etc/openvswitch/
+          name: etc-openvswitch
+        - mountPath: /etc/ovn/
+          name: etc-openvswitch
+        - mountPath: /var/lib/openvswitch/
+          name: var-lib-openvswitch
+        - mountPath: /run/openvswitch/
+          name: run-openvswitch
+        - mountPath: /run/ovn/
+          name: run-ovn
+        - mountPath: /run/ovnkube-config/
+          name: ovnkube-config
+        - mountPath: /env
+          name: env-overrides
+        - mountPath: /ovn-cert
+          name: ovn-cert
+        - mountPath: /ovn-ca
+          name: ovn-ca
+        resources:
+          requests:
+            cpu: 10m
+            memory: 300Mi
+        env:
+        - name: OVN_KUBE_LOG_LEVEL
+          value: "4"
+        - name: K8S_NODE
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        - name: OVN_SB_DB_LIST
+          value: "{{.OVN_SB_DB_LIST}}"
+        - name: OVN_CERT_CN
+          value:  "{{.OVN_CERT_CN}}"
+        - name: OVN_NB_DB_LIST
+          value: "{{.OVN_NB_DB_LIST}}"
+        ports:
+        - name: metrics-port
+          containerPort: 29102
+        terminationMessagePolicy: FallbackToLogsOnError
+      # ovn-dbchecker: monitor clustered ovn databases for db health and stale raft members
+      - name: ovn-dbchecker
+        image: "{{.OvnImage}}"
+        command:
+        - /bin/bash
+        - -c
+        - |
+           echo "[yaml] Calling ovnkube-cno-master.sh [run_ovn_dbchecker]" 
+           /root/ovnkube-cno-master.sh run-ovn-dbchecker
+           echo "[yaml] Returned from ovnkube-cno-master.sh [run_ovn_dbchecker]" 
+        volumeMounts:
+        - mountPath: /etc/openvswitch/
+          name: etc-openvswitch
+        - mountPath: /etc/ovn/
+          name: etc-openvswitch
+        - mountPath: /var/lib/openvswitch/
+          name: var-lib-openvswitch
+        - mountPath: /run/openvswitch/
+          name: run-openvswitch
+        - mountPath: /run/ovn/
+          name: run-ovn
+        - mountPath: /run/ovnkube-config/
+          name: ovnkube-config
+        - mountPath: /env
+          name: env-overrides
+        - mountPath: /ovn-cert
+          name: ovn-cert
+        - mountPath: /ovn-ca
+          name: ovn-ca
+        resources:
+          requests:
+            cpu: 10m
+            memory: 300Mi
+        env:
+        - name: OVN_KUBE_LOG_LEVEL
+          value: "4"
+        - name: OVN_SB_DB_LIST
+          value: "{{.OVN_SB_DB_LIST}}" 
+        - name: OVN_CERT_CN
+          value:  "{{.OVN_CERT_CN}}"
+        - name: OVN_NB_DB_LIST
+          value: "{{.OVN_NB_DB_LIST}}"
+        terminationMessagePolicy: FallbackToLogsOnError
+      nodeSelector:
+        node-role.kubernetes.io/master: ""
+        beta.kubernetes.io/os: "linux"
+      volumes:
+      # for checking ovs-configuration service
+      - name: systemd-units
+        hostPath:
+          path: /etc/systemd/system
+      - name: etc-openvswitch
+        hostPath:
+          path: /var/lib/ovn/etc
+      - name: var-lib-openvswitch
+        hostPath:
+          path: /var/lib/ovn/data
+      - name: run-openvswitch
+        hostPath:
+          path: /var/run/openvswitch
+      - name: run-ovn
+        hostPath:
+          path: /var/run/ovn
+      - name: ovnkube-config
+        configMap:
+          name: ovnkube-config
+      - name: env-overrides
+        configMap:
+          name: env-overrides
+          optional: true
+      - name: ovn-ca
+        configMap:
+          name: ovn-ca
+      - name: ovn-cert
+        secret:
+          secretName: ovn-cert
+      - name: ovn-master-metrics-cert
+        secret:
+          secretName: ovn-master-metrics-cert
+          optional: true
+      tolerations:
+      - key: "node-role.kubernetes.io/master"
+        operator: "Exists"
+      - key: "node.kubernetes.io/not-ready"
+        operator: "Exists"
+      - key: "node.kubernetes.io/unreachable"
+        operator: "Exists"
+      - key: "node.kubernetes.io/network-unavailable"
+        operator: "Exists"

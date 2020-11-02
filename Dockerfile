@@ -11,6 +11,8 @@ COPY --from=builder /tmp/build/cluster-network-operator /usr/bin/
 COPY --from=builder /tmp/build/cluster-network-renderer /usr/bin/
 COPY manifests /manifests
 COPY bindata /bindata
+COPY bindata/network/ovn-kubernetes/ovnkube-cno-master.sh /root
+COPY bindata/network/ovn-kubernetes/ovnkube-cno-node.sh /root
 ENV OPERATOR_NAME=cluster-network-operator
 CMD ["/usr/bin/cluster-network-operator"]
 LABEL io.openshift.release.operator true
